@@ -1,9 +1,6 @@
 # 认识C++移动语义与右值引用  
 本文假设读者对C++基本语法和常见STL组件的基本操作有一定的了解。<br>
 
-- **移动语义让程序员在复制对象时有所选择。**<br>
-- **右值引用是C++语法层面表示移动语义的机制。**<br>
-- **`std::move()`没有移动任何东西，只是把一个表达式转型（cast）为右值。**<br>
 
 ## 移动一个`std::vector` <br>
 在介绍右值引用或移动语义时，常见到移动语义能提高复制对象性能的说法，那么这究竟是怎么回事呢？一起来看移动构造`std::vector`的例子，在脑海中快速地建立起移动语义的概念。<br>
@@ -140,7 +137,36 @@ template<typename _Tp> // 模板参数
 ```
 除下面目可怖的type traits和下划线前缀之后，这个函数的本质是`static_cast<T&&>(t)`，一个静态转型的包装。但标准库仍然提供这个转型函数，是方便程序员在代码里明确地表达移动的意图：放弃该对象所持有资源的所有权，转移给其他对象。<br>
 
-在C++标准库中，有大量的仅移动类型，最典型的莫过于智能指针类`std::unique_ptr`了。它主要用来帮助自动管理内存，当对象离开作用域时析构并释放内存。接下来，把上文提到的知识运用起来，尝试编写一个玩具款的`unique_ptr`[例5]：<br>
+“移动语义提升性能”的说法看似肤浅，其实别有深意，很多平凡（trivial）的场景实际涉及到不平凡的操作，比如[例5]：<br>
+```
+    template <T>
+    void swap(T& a, T& b) {
+        T tmp = a;
+        a = b;
+        b = tmp;
+    }
+
+    std::vector<int> vec_a(100, 1);
+    std::vector<int> vec_b(666, -1);
+    swap(vec_a, vec_b); // 复制！
+    
+    std::unique_ptr<int> p_a = std::make_unique<int>(1);
+    std::unique_ptr<int> p_b = std::make_unique<int>(2);
+    swap(p_a, p_b) // 编译错误！
+```
+如果一个交换操作按照直觉写，在C++值语义的环境下就会导致较差的伸缩性——默认情况下赋值运算符总是深复制对象，更别提如果该类的对象不能被复制、只能被移动，这个交换操作连编译都过不了。因此，在当代C++中，交换操作应该这么写：<br>
+```
+template<typename T>
+void swap(T& a, T& b)
+{
+    T tmp = std::move(a);
+    a = std::move(b);
+    b = std::move(tmp);
+}
+```
+这样编写的交换函数强制了移动语义，从而在类对象重载了移动操作时正确地进行调用，从而节约不必要的复制；但这个强制有很强的偏向性，如果一个类禁用了移动操作，那么这个类也无法使用这个交换操作（极少有禁用移动语义的情况）。<br>
+
+实际上，在C++标准库中，有大量的不可复制、仅移动的类型，最典型的莫过于智能指针类`std::unique_ptr`了。它主要用来帮助自动管理内存，当对象离开作用域时析构并释放内存。接下来，把上文提到的知识运用起来，尝试编写一个玩具款的`unique_ptr`[例6]：<br>
 ```
 // 玩具unique_ptr
 template <typename T>
@@ -163,6 +189,8 @@ public:
 template <typename T>
 class my_unique_ptr
 {
+    T* ptr_;
+public:
     // 移动构造函数
     my_unique_ptr(my_unique_ptr&& oth) :
         ptr_(std::exchange(oth.ptr_, nullptr)) {}
@@ -174,7 +202,7 @@ class my_unique_ptr
             if (ptr_) { // 释放当前拥有的指针
                 delete ptr_;
             }
-            ptr_ = std::exchange(oth.ptr_, nullptr); // 夺取rhs的指针
+            ptr_ = std::exchange(rhs.ptr_, nullptr); // 夺取rhs的指针
         }
         return *this;
     }
@@ -192,11 +220,79 @@ class my_unique_ptr
     my_unique_ptr<int> pi = new int(5);
     use_int(std::move(pi));
 ```
-、、、未完待续、、、
-有了移动语义，可以正确表达资源所有权，很大程度上解决memory corruption问题；
-T&&，右值重载还是万能引用？std::forward; C++ initialization: science or art？
+
+## 让移动操作不抛出异常
+
+C++提供了表达运行时错误的异常机制，可以通过[`throw`][5]关键字来抛出异常对象；相应地，在使用异常机制的语境下，发展出了“异常安全”的概念。比如，往一个`std::vector`对象中添加一个新元素时，如果其预先分配的数组已满，其会申请一块更大的内存；但如果内存耗尽，内存分配器抛出异常`std::bad_alloc`。根据标准，`std::vector`申请新内存失败后，原有数组应保持不变，这被称为[strong exception guarantee][6]。声明考虑exception guarantee后，尝试编写`std::vector`的扩容函数[例7]：
+```
+void reallocate() {
+    size_t new_capacity = capacity_ * 2;
+
+    // 申请内存：内存不足时会抛异常！
+    T* new_data = allocate(sizeof(T) * new_capacity);
+
+    // 移动或复制已有元素到新数组
+    if ( can_nothrow_move_contruct<T> ) { // 如果T的移动构造函数不抛出异常，则移动构造
+        for (size_t i = 0; i < size_; ++i) {
+            new (new_data[i]) T( std::move(data_[i]) );
+        }
+    }
+    else { // 否则复制构造
+        try {
+            for (size_t i = 0; i < size_; ++i) {
+                new (new_data[i]) T(data_[i]);
+            }
+        }
+        catch (...) {           // 如果复制构造抛出异常：
+            destroy(new_data);  // 析构新数组每个已经构造的元素
+            free(new_data);     // 释放内存
+            throw;              // 重新抛出异常给vector调用者
+        }
+    }
+}
+```
+假如移动第n个元素到新数组时，T的移动构造抛出异常，就会导致新数组中有n - 1个完好的元素，第n个元素状态未定义；而旧数组中则有n - 1个被移动过的元素，1个未定义的元素，还可能一些剩下未移动的元素。这时，`vector`的状态就难以恢复了。因此，为了保证异常安全，如果类型`T`的移动构造函数不应该抛出异常，否则，`vector`在扩容时仍然会复制，而不是移动元素！<br>
+
+在C++中，可以通过[`noexcept`][7]符号声明一个函数不会抛出异常。编译器不会给一个`noexcept`函数生成异常处理代码，并会检查该函数中调用的其他函数是否也是`noexcept`的。那么，[例6]中`my_unique_ptr`的具有移动语义函数的声明应为：
+```
+template <typename T>
+class my_unique_ptr
+{
+    T* ptr_;
+public:
+    // 移动构造函数
+    my_unique_ptr(my_unique_ptr&& oth) noexcept;
+
+    // 移动赋值函数
+    my_unique_ptr& operator=(my_unique_ptr&& rhs) noexcept;
+};
+```
+总结一下：<br>
+- **移动语义让程序员在复制对象时有所选择。**<br>
+- **右值引用是C++语法层面表示移动语义的机制。**<br>
+- **`std::move()`没有移动任何东西，只是把一个表达式转型（cast）为右值。**<br>
+- **尽量让具有移动语义的函数`noexcept`。**
+
+本文留了点小尾巴！下集预告：函数具有多个入参时（比如工厂函数），难道需要针对每个参数左、右值的组合进行重载？`T&&`竟然不是右值引用？`std::forward()`又是什么？
+
+## 参考资料
+[Scott Meyers, Effective Modern C++][9]<br>
+[KholdCode, Moves demystified][1]<br>
+[Thomas Becker, C++ Rvalue References Explained][8]<br>
+[Nis Meinert, Demystifying Value Categories in C++][10]<br>
+[Klaus Iglberger, Back to Basics: Move Semantics (part 1 of 2)][11]<br>
+[Herb Sutter, Writing Good C++14... By Default][12]<br>
+
 
 [1]: https://kholdstare.github.io/technical/2013/11/23/moves-demystified.html
 [2]: https://godbolt.org/z/5WW8oj
 [3]: https://en.cppreference.com/w/cpp/language/value_category
 [4]: https://gcc.gnu.org/onlinedocs/libstdc++/latest-doxygen/a00416_source.html
+[5]: https://en.cppreference.com/w/cpp/language/throw
+[6]: https://en.cppreference.com/w/cpp/container/vector/push_back
+[7]: https://en.cppreference.com/w/cpp/language/noexcept_spec
+[8]: http://thbecker.net/articles/rvalue_references/section_01.html
+[9]: https://book.douban.com/subject/25923597/
+[10]: https://indico.cern.ch/event/853710/contributions/3708821/attachments/1979863/3296506/slides.pdf
+[11]: https://www.youtube.com/watch?v=St0MNEU5b0o
+[12]: https://www.youtube.com/watch?v=hEx5DNLWGgA
