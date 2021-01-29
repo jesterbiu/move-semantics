@@ -232,19 +232,21 @@ void reallocate() {
     T* new_data = allocate(sizeof(T) * new_capacity);
 
     // 移动或复制已有元素到新数组
-    if ( can_nothrow_move_contruct<T> ) { // 如果T的移动构造函数不抛出异常，则移动构造
-        for (size_t i = 0; i < size_; ++i) {
-            new (new_data[i]) T( std::move(data_[i]) );
-        }
+    T* first = data_;
+    T* last = data_ + size_;
+    if ( can_nothrow_move_contruct<T> ) {     // 如果T的移动构造函数不抛出异常，则移动构造    
+        move_contruct(first, last, new_data); // 在new_data所指向的内存上移动构造[first, last)范围的元素
     }
     else { // 否则复制构造
         try {
-            for (size_t i = 0; i < size_; ++i) {
-                new (new_data[i]) T(data_[i]);
+            T* constructed_first = new_data;
+            T* constructed_last = new_data;
+            while (first != last) {
+                copy(first++, constructed_last++); // 复制构造
             }
         }
         catch (...) {           // 如果复制构造抛出异常：
-            destroy(new_data);  // 析构新数组每个已经构造的元素
+            destroy(constructed_first, constructed_last);  // 析构新数组中已经构造的元素
             free(new_data);     // 释放内存
             throw;              // 重新抛出异常给vector调用者
         }
